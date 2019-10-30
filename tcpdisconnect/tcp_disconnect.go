@@ -134,12 +134,13 @@ func getTargetPID(PIDs []uint32) (uint32, error) {
 			return 0, ErrEnumProcessModulesFailed
 		}
 
-		lpBaseName := make([]byte, 500)
+		lpBaseNameSize := 1024 // Doesnt seem like this size matters for the function call, but we do it anyways
+		lpBaseName := make([]byte, lpBaseNameSize)
 		for i := 0; i < int(lpcbNeeded/LPDWORD_SIZE); i++ {
 			mh := hModules[i]
 
 			// For getModuleBaseName, the return value indicates bytes written to the buffer. If the value is 0, an error occurred
-			bytesWritten, _, err := getModuleBaseName.Call(uintptr(hProcess), uintptr(mh), uintptr(unsafe.Pointer(&lpBaseName[0])), 10000)
+			bytesWritten, _, err := getModuleBaseName.Call(uintptr(hProcess), uintptr(mh), uintptr(unsafe.Pointer(&lpBaseName[0])), uintptr(unsafe.Pointer(&lpBaseNameSize)))
 			if err != windows.ERROR_SUCCESS {
 				return 0, err
 			}
