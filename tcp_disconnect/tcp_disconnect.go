@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"golang.org/x/sys/windows"
 	"strings"
 	"syscall"
@@ -12,13 +13,21 @@ var (
 	// Load the libraries needed
 	psapi    = windows.NewLazySystemDLL("psapi.dll")
 	iphlpapi = windows.NewLazySystemDLL("iphlpapi.dll")
+	user32   = windows.NewLazySystemDLL("user32.dll")
+	//kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
 	// Link the functions in those libraries so we can call them.
-	getTcpTable2       = iphlpapi.NewProc("GetTcpTable2")
-	setTcpEntry        = iphlpapi.NewProc("SetTcpEntry")
-	enumProcesses      = psapi.NewProc("EnumProcesses")
-	enumProcessModules = psapi.NewProc("EnumProcessModules")
-	getModuleBaseName  = psapi.NewProc("GetModuleBaseNameA")
+	getTcpTable2             = iphlpapi.NewProc("GetTcpTable2")
+	setTcpEntry              = iphlpapi.NewProc("SetTcpEntry")
+	enumProcesses            = psapi.NewProc("EnumProcesses")
+	enumProcessModules       = psapi.NewProc("EnumProcessModules")
+	getModuleBaseName        = psapi.NewProc("GetModuleBaseNameA")
+	getWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	enumWindows              = user32.NewProc("EnumWindows")
+	setWindowsHookExA        = user32.NewProc("SetWindowsHookExA")
+	callNextHookEx           = user32.NewProc("CallNextHookEx")
+	unhookWindowsHookEx      = user32.NewProc("UnhookWindowsHookEx")
+	//getModuleHandleA         = kernel32.NewProc("GetModuleHandleA")
 
 	// Errors
 	ErrEnumProcessesFailed      = errors.New("an error occurred when calling enumProcesses")
@@ -26,6 +35,8 @@ var (
 	ErrGetModuleBaseNameFailed  = errors.New("an error occurred when calling getModuleBaseName")
 	ErrTargetPIDNotFound        = errors.New("unable to find target PID")
 	ErrTargetConnectionNotFound = errors.New("unable to find target connection")
+	ErrUnableToSetHook          = errors.New("unable to set hook")
+	ErrUnableToUnhook          = errors.New("unable to unhook the hook")
 
 	// Sizes
 	LPDWORD_SIZE = uint32(unsafe.Sizeof(uint64(0)))
@@ -37,8 +48,23 @@ const (
 	ANY_SIZE                 = 1
 	ORDER                    = 1
 	MIB_TCP_STATE_DELETE_TCB = 12
+	WH_KEYBOARD_LL           = 13
+	WH_KEYBOARD              = 2
+	WM_KEYDOWN               = 256
+	WM_SYSKEYDOWN            = 260
+	WM_KEYUP                 = 257
+	WM_SYSKEYUP              = 261
+	WM_KEYFIRST              = 256
+	WM_KEYLAST               = 264
+	PM_NOREMOVE              = 0x000
+	PM_REMOVE                = 0x001
+	PM_NOYIELD               = 0x002
+	WM_LBUTTONDOWN           = 513
+	WM_RBUTTONDOWN           = 516
+	NULL                     = 0
 )
 
+// MIB_TCPROW2 - https://docs.microsoft.com/en-us/windows/win32/api/tcpmib/ns-tcpmib-mib_tcprow2
 type MIB_TCPROW2 struct {
 	dwState        uint32
 	dwLocalAddr    uint32
@@ -49,13 +75,38 @@ type MIB_TCPROW2 struct {
 	dwOffloadState uint32
 }
 
+// MIB_TCPTABLE2 - https://docs.microsoft.com/en-us/windows/win32/api/tcpmib/ns-tcpmib-mib_tcptable2
 type MIB_TCPTABLE2 struct {
 	dwNumEntries uint32
 	table        [ANY_SIZE]MIB_TCPROW2
 }
 
-// getTcpTable returns a map from a PID to a TCP connection
-func getTcpTable() (map[uint32]MIB_TCPROW2, error) {
+// KBDLLHOOKSTRUCT - docs https://docs.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-kbdllhookstruct
+type KBDLLHOOKSTRUCT struct {
+	vkCode      uint32
+	scanCode    uint32
+	flags       uint32
+	time        uint32
+	dwExtraInfo uint32
+}
+
+// POINT - http://msdn.microsoft.com/en-us/library/windows/desktop/dd162805.aspx
+type POINT struct {
+	X, Y int32
+}
+
+// MSG - https://docs.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-msg
+type MSG struct {
+	Hwnd uintptr
+	Message uint32
+	WParam uintptr
+	LParam uintptr
+	Time uint32
+	Pt POINT
+}
+
+// GetTcpTable2 returns a map from a PID to a TCP connection
+func GetTcpTable2() (map[uint32]MIB_TCPROW2, error) {
 	// First we checkout how many entries exist, this will throw an error
 	// If the error is ERROR_INSUFFICIENT_BUFFER, the `size` will now be he required number of bytes needed
 	var size uint32
@@ -87,8 +138,8 @@ func getTcpTable() (map[uint32]MIB_TCPROW2, error) {
 	return connections, nil
 }
 
-// getPIDs returns an array of processIDs
-func getPIDs() ([]uint32, error) {
+// EnumProcesses returns an array of currently active processIDs
+func EnumProcesses() ([]uint32, error) {
 	lpidProcess := make([]uint32, 10000)
 	var cb uint32
 	var lpcbNeeded uint64 // We ignore the number of bytes returned
@@ -102,6 +153,71 @@ func getPIDs() ([]uint32, error) {
 	}
 
 	return lpidProcess, nil
+}
+
+func SetWindowsHookEx(keyboardHookID int, callback, moduleHandle, threadID uintptr) (hook uintptr, err error) {
+	hook, _, winErr := setWindowsHookExA.Call(WH_KEYBOARD_LL, callback, moduleHandle, threadID)
+	if winErr != windows.ERROR_SUCCESS {
+		return NULL, winErr
+	}
+
+	if hook == NULL {
+		return NULL, ErrUnableToSetHook
+	}
+
+	return hook, nil
+}
+
+func CallNextHookEx(hook uintptr, aCode int, wParam, lParam uintptr) uintptr {
+	returnCode, _, _ := callNextHookEx.Call(hook, uintptr(unsafe.Pointer(&aCode)), wParam, lParam)
+
+	return returnCode
+}
+
+func EnumProcessModules(processHandle syscall.Handle) (moduleHandles []uint64, bytesNeeded uint32, err error) {
+	// Enumerate the process modules, giving us a module handle
+	hModules := make([]uint64, 1024)
+	var hModuleSize uint32
+	var lpcbNeeded uint32
+	winErrCode, _, winErr := enumProcessModules.Call(uintptr(processHandle), uintptr(unsafe.Pointer(&hModules[0])), uintptr(unsafe.Pointer(&hModuleSize)), uintptr(unsafe.Pointer(&lpcbNeeded)))
+	if winErr != windows.ERROR_SUCCESS {
+		return nil, 0, winErr
+	}
+
+	if winErrCode == 0 {
+		return nil, 0, ErrEnumProcessModulesFailed
+	}
+
+	return hModules, lpcbNeeded, nil
+}
+
+func GetModuleBaseName(processHandle syscall.Handle, moduleHandle uint64, nameBuffer []byte, nameBufferSize int) (moduleName string, err error) {
+	// For getModuleBaseName, the return value indicates bytes written to the buffer. If the value is 0, an error occurred
+	bytesWritten, _, err := getModuleBaseName.Call(uintptr(processHandle), uintptr(moduleHandle), uintptr(unsafe.Pointer(&nameBuffer[0])), uintptr(unsafe.Pointer(&nameBufferSize)))
+	if err != windows.ERROR_SUCCESS {
+		return moduleName, err
+	}
+
+	if bytesWritten == 0 {
+		return moduleName, ErrGetModuleBaseNameFailed
+	}
+
+	str := string(nameBuffer[:bytesWritten])
+
+	return str, nil
+}
+
+func UnhookWindowsHookEx(hHook uintptr) error {
+	returnCode, _, winErr := unhookWindowsHookEx.Call(hHook)
+	if winErr != windows.ERROR_SUCCESS {
+		return ErrUnableToUnhook
+	}
+
+	if returnCode <= 0 {
+		return windows.Errno(returnCode)
+	}
+
+	return nil
 }
 
 func getTargetPID(PIDs []uint32) (uint32, error) {
@@ -122,16 +238,9 @@ func getTargetPID(PIDs []uint32) (uint32, error) {
 		}
 
 		// Enumerate the process modules, giving us a module handle
-		hModules := make([]uint64, 1024)
-		var hModuleSize uint32
-		var lpcbNeeded uint32
-		winErrCode, _, winErr := enumProcessModules.Call(uintptr(hProcess), uintptr(unsafe.Pointer(&hModules[0])), uintptr(unsafe.Pointer(&hModuleSize)), uintptr(unsafe.Pointer(&lpcbNeeded)))
-		if winErr != windows.ERROR_SUCCESS {
-			return 0, winErr
-		}
-
-		if winErrCode == 0 {
-			return 0, ErrEnumProcessModulesFailed
+		hModules, lpcbNeeded, err := EnumProcessModules(hProcess)
+		if err != nil {
+			panic(err)
 		}
 
 		lpBaseNameSize := 1024 // Doesnt seem like this size matters for the function call, but we do it anyways
@@ -139,18 +248,15 @@ func getTargetPID(PIDs []uint32) (uint32, error) {
 		for i := 0; i < int(lpcbNeeded/LPDWORD_SIZE); i++ {
 			mh := hModules[i]
 
-			// For getModuleBaseName, the return value indicates bytes written to the buffer. If the value is 0, an error occurred
-			bytesWritten, _, err := getModuleBaseName.Call(uintptr(hProcess), uintptr(mh), uintptr(unsafe.Pointer(&lpBaseName[0])), uintptr(unsafe.Pointer(&lpBaseNameSize)))
-			if err != windows.ERROR_SUCCESS {
-				return 0, err
+			str, err := GetModuleBaseName(hProcess, mh, lpBaseName, lpBaseNameSize)
+			if err != nil {
+				panic(err)
 			}
 
-			if bytesWritten == 0 {
-				return 0, ErrGetModuleBaseNameFailed
-			}
-
-			str := string(lpBaseName[:bytesWritten])
 			if strings.Contains(strings.ToLower(str), "exile") {
+				//a1, b2, c3 := getModuleHandleA.Call(0)
+				//fmt.Println(a1, b2, c3)
+
 				return p, nil
 			}
 		}
@@ -159,10 +265,8 @@ func getTargetPID(PIDs []uint32) (uint32, error) {
 	return 0, ErrTargetPIDNotFound
 }
 
-func killTargetConnection(mib MIB_TCPROW2) error {
-	connection := mib
-	connection.dwState = MIB_TCP_STATE_DELETE_TCB
-	windowsErrorCode, _, err := setTcpEntry.Call(uintptr(unsafe.Pointer(&connection)))
+func SetTcpEntry(mib MIB_TCPROW2) error {
+	windowsErrorCode, _, err := setTcpEntry.Call(uintptr(unsafe.Pointer(&mib)))
 	if err != windows.ERROR_SUCCESS {
 		return err
 	}
@@ -174,18 +278,56 @@ func killTargetConnection(mib MIB_TCPROW2) error {
 	return nil
 }
 
-func main() {
-	// TODO: Ask for elevation if rights are not admin
-	// TODO: Enable killing various processes by name, specified either as a flag or through a gui
-	// TODO: Enable choosing key combination for killing the connections, either as a flag or through a gui
-	// TODO: Monitor the process so we catch it when it creates a new connection after being killed
-	// TODO: Monitor the target process so that if it terminates, and is started again, we find it
-	tcpConnections, err := getTcpTable()
+func getWindowHandleForPID(targetPID uint32) (syscall.Handle, error) {
+	var hwnd syscall.Handle
+	var err error
+	callback := syscall.NewCallback(func(h syscall.Handle) uintptr {
+		var pid uint32
+		var c bool
+		_, _, winErr := getWindowThreadProcessId.Call(uintptr(h), uintptr(unsafe.Pointer(&pid)))
+		if winErr != windows.ERROR_SUCCESS {
+			err = winErr
+			c = true
+
+			// If an error occurs, we stop the enumeration
+			return uintptr(unsafe.Pointer(&c))
+		}
+
+		// TODO: Why is this if hit multiple times even though i return true? It seems like my boolean return is actually ignored
+		// EDIT: Processes can have multiple window handles, and for whatever reason, it seems PoE has 3
+		if pid == targetPID {
+			hwnd = h
+			c = true
+
+			// If we find the window, we stop the enumeration
+			return uintptr(unsafe.Pointer(&c))
+		}
+
+		// If we dont find it, we keep looking
+		c = false
+
+		return uintptr(unsafe.Pointer(&c))
+	})
+
+	winCode, _, winErr := enumWindows.Call(callback, 0)
+	if winErr != windows.ERROR_SUCCESS {
+		return hwnd, winErr
+	}
+
+	if winCode != 0 {
+		return hwnd, windows.Errno(winCode)
+	}
+
+	return hwnd, nil
+}
+
+func start() {
+	tcpConnections, err := GetTcpTable2()
 	if err != nil {
 		panic(err)
 	}
 
-	PIDs, err := getPIDs()
+	PIDs, err := EnumProcesses()
 	if err != nil {
 		panic(err)
 	}
@@ -195,13 +337,53 @@ func main() {
 		panic(err)
 	}
 
-	mib, ok := tcpConnections[targetPID]
+	_, ok := tcpConnections[targetPID]
 	if !ok {
 		panic(ErrTargetConnectionNotFound)
 	}
 
-	err = killTargetConnection(mib)
+	// Kill the target connection
+	//mib.dwState = MIB_TCP_STATE_DELETE_TCB
+	//err = SetTcpEntry(mib)
+	//if err != nil {
+	//	panic(err)
+	//}
+
+	//windowHandle, err := getWindowHandleForPID(13652)
+	//fmt.Println(windowHandle, err)
+
+	cb := func(aCode int, wParam uintptr, lParam uintptr) uintptr {
+		if aCode == 0 && wParam == WM_KEYDOWN {
+			fmt.Println("key pressed:")
+			kbdstruct := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
+			code := byte(kbdstruct.vkCode)
+			fmt.Printf("%q", code)
+		}
+
+		return CallNextHookEx(NULL, aCode, wParam, lParam)
+	}
+
+	hook, err := SetWindowsHookEx(WH_KEYBOARD_LL, syscall.NewCallback(cb), 0, 0)
 	if err != nil {
 		panic(err)
 	}
+
+	defer UnhookWindowsHookEx(hook)
+}
+
+func main() {
+	// TODO: Ask for elevation if rights are not admin
+	// TODO: Enable killing various processes by name, specified either as a flag or through a gui
+	// TODO: Enable choosing key combination for killing the connections, either as a flag or through a gui
+	// TODO: Monitor the process so we catch it when it creates a new connection after being killed
+	// TODO: Monitor the target process so that if it terminates, and is started again, we find it
+	// TODO: Remember to free all the libraries
+	// TODO: Remember to unhook hooks (v)
+
+	go start()
+	defer func() {
+		if r := recover(); r != nil {
+			panic(r.(error))
+		}
+	}()
 }
