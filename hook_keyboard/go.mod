@@ -1,4 +1,4 @@
-module playground/hookie
+module playground/hook_keyboard
 
 go 1.12
 
