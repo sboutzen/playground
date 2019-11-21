@@ -1,4 +1,4 @@
-package hook_keyboard
+package hookie
 
 import (
 	"context"

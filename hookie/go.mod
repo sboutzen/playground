@@ -1,4 +1,4 @@
-module github.com/sboutzen/playground/hook_keyboard
+module github.com/sboutzen/playground/hookie
 
 go 1.12
 
