@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/sboutzen/playground/hookie"
 	"golang.org/x/sys/windows"
 	"strings"
 	"syscall"
@@ -24,9 +26,6 @@ var (
 	getModuleBaseName        = psapi.NewProc("GetModuleBaseNameA")
 	getWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
 	enumWindows              = user32.NewProc("EnumWindows")
-	setWindowsHookExA        = user32.NewProc("SetWindowsHookExA")
-	callNextHookEx           = user32.NewProc("CallNextHookEx")
-	unhookWindowsHookEx      = user32.NewProc("UnhookWindowsHookEx")
 	//getModuleHandleA         = kernel32.NewProc("GetModuleHandleA")
 
 	// Errors
@@ -35,8 +34,6 @@ var (
 	ErrGetModuleBaseNameFailed  = errors.New("an error occurred when calling getModuleBaseName")
 	ErrTargetPIDNotFound        = errors.New("unable to find target PID")
 	ErrTargetConnectionNotFound = errors.New("unable to find target connection")
-	ErrUnableToSetHook          = errors.New("unable to set hook")
-	ErrUnableToUnhook          = errors.New("unable to unhook the hook")
 
 	// Sizes
 	LPDWORD_SIZE = uint32(unsafe.Sizeof(uint64(0)))
@@ -79,30 +76,6 @@ type MIB_TCPROW2 struct {
 type MIB_TCPTABLE2 struct {
 	dwNumEntries uint32
 	table        [ANY_SIZE]MIB_TCPROW2
-}
-
-// KBDLLHOOKSTRUCT - docs https://docs.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-kbdllhookstruct
-type KBDLLHOOKSTRUCT struct {
-	vkCode      uint32
-	scanCode    uint32
-	flags       uint32
-	time        uint32
-	dwExtraInfo uint32
-}
-
-// POINT - http://msdn.microsoft.com/en-us/library/windows/desktop/dd162805.aspx
-type POINT struct {
-	X, Y int32
-}
-
-// MSG - https://docs.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-msg
-type MSG struct {
-	Hwnd uintptr
-	Message uint32
-	WParam uintptr
-	LParam uintptr
-	Time uint32
-	Pt POINT
 }
 
 // GetTcpTable2 returns a map from a PID to a TCP connection
@@ -155,25 +128,6 @@ func EnumProcesses() ([]uint32, error) {
 	return lpidProcess, nil
 }
 
-func SetWindowsHookEx(keyboardHookID int, callback, moduleHandle, threadID uintptr) (hook uintptr, err error) {
-	hook, _, winErr := setWindowsHookExA.Call(WH_KEYBOARD_LL, callback, moduleHandle, threadID)
-	if winErr != windows.ERROR_SUCCESS {
-		return NULL, winErr
-	}
-
-	if hook == NULL {
-		return NULL, ErrUnableToSetHook
-	}
-
-	return hook, nil
-}
-
-func CallNextHookEx(hook uintptr, aCode int, wParam, lParam uintptr) uintptr {
-	returnCode, _, _ := callNextHookEx.Call(hook, uintptr(unsafe.Pointer(&aCode)), wParam, lParam)
-
-	return returnCode
-}
-
 func EnumProcessModules(processHandle syscall.Handle) (moduleHandles []uint64, bytesNeeded uint32, err error) {
 	// Enumerate the process modules, giving us a module handle
 	hModules := make([]uint64, 1024)
@@ -205,19 +159,6 @@ func GetModuleBaseName(processHandle syscall.Handle, moduleHandle uint64, nameBu
 	str := string(nameBuffer[:bytesWritten])
 
 	return str, nil
-}
-
-func UnhookWindowsHookEx(hHook uintptr) error {
-	returnCode, _, winErr := unhookWindowsHookEx.Call(hHook)
-	if winErr != windows.ERROR_SUCCESS {
-		return ErrUnableToUnhook
-	}
-
-	if returnCode <= 0 {
-		return windows.Errno(returnCode)
-	}
-
-	return nil
 }
 
 func getTargetPID(PIDs []uint32) (uint32, error) {
@@ -322,25 +263,25 @@ func getWindowHandleForPID(targetPID uint32) (syscall.Handle, error) {
 }
 
 func start() {
-	tcpConnections, err := GetTcpTable2()
-	if err != nil {
-		panic(err)
-	}
-
-	PIDs, err := EnumProcesses()
-	if err != nil {
-		panic(err)
-	}
-
-	targetPID, err := getTargetPID(PIDs)
-	if err != nil {
-		panic(err)
-	}
-
-	_, ok := tcpConnections[targetPID]
-	if !ok {
-		panic(ErrTargetConnectionNotFound)
-	}
+	//tcpConnections, err := GetTcpTable2()
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//PIDs, err := EnumProcesses()
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//targetPID, err := getTargetPID(PIDs)
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//_, ok := tcpConnections[targetPID]
+	//if !ok {
+	//	panic(ErrTargetConnectionNotFound)
+	//}
 
 	// Kill the target connection
 	//mib.dwState = MIB_TCP_STATE_DELETE_TCB
@@ -352,23 +293,18 @@ func start() {
 	//windowHandle, err := getWindowHandleForPID(13652)
 	//fmt.Println(windowHandle, err)
 
-	cb := func(aCode int, wParam uintptr, lParam uintptr) uintptr {
-		if aCode == 0 && wParam == WM_KEYDOWN {
-			fmt.Println("key pressed:")
-			kbdstruct := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
-			code := byte(kbdstruct.vkCode)
-			fmt.Printf("%q", code)
+
+	ctx := context.Background()
+	ch := make(chan byte, 10)
+	errorCh := make(chan error, 10)
+	go hookie.HookKeyboard(ctx, ch, errorCh)
+	for {
+		select {
+		case c := <- ch:
+			fmt.Println("in selectyoyoyo")
+			fmt.Printf("%q", c)
 		}
-
-		return CallNextHookEx(NULL, aCode, wParam, lParam)
 	}
-
-	hook, err := SetWindowsHookEx(WH_KEYBOARD_LL, syscall.NewCallback(cb), 0, 0)
-	if err != nil {
-		panic(err)
-	}
-
-	defer UnhookWindowsHookEx(hook)
 }
 
 func main() {
@@ -380,7 +316,8 @@ func main() {
 	// TODO: Remember to free all the libraries
 	// TODO: Remember to unhook hooks (v)
 
-	go start()
+	start()
+
 	defer func() {
 		if r := recover(); r != nil {
 			panic(r.(error))
