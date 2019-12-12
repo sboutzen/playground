@@ -8,6 +8,7 @@ import (
 	"golang.org/x/sys/windows"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -262,47 +263,87 @@ func getWindowHandleForPID(targetPID uint32) (syscall.Handle, error) {
 	return hwnd, nil
 }
 
-func start() {
-	//tcpConnections, err := GetTcpTable2()
-	//if err != nil {
-	//	panic(err)
-	//}
-	//
-	//PIDs, err := EnumProcesses()
-	//if err != nil {
-	//	panic(err)
-	//}
-	//
-	//targetPID, err := getTargetPID(PIDs)
-	//if err != nil {
-	//	panic(err)
-	//}
-	//
-	//_, ok := tcpConnections[targetPID]
-	//if !ok {
-	//	panic(ErrTargetConnectionNotFound)
-	//}
+func getPoeConnection() (MIB_TCPROW2, error) {
+	var connection MIB_TCPROW2
+	tcpConnections, err := GetTcpTable2()
+	if err != nil {
+		return connection, err
+	}
 
-	// Kill the target connection
-	//mib.dwState = MIB_TCP_STATE_DELETE_TCB
-	//err = SetTcpEntry(mib)
-	//if err != nil {
-	//	panic(err)
-	//}
+	PIDs, err := EnumProcesses()
+	if err != nil {
+		return connection, err
+	}
+
+	targetPID, err := getTargetPID(PIDs)
+	if err != nil {
+		return connection, err
+	}
+
+	mib, ok := tcpConnections[targetPID]
+	if !ok {
+		return connection, ErrTargetConnectionNotFound
+	}
+
+	return mib, err
+}
+
+func waitForPoeConnection() (MIB_TCPROW2, error) {
+	var empty MIB_TCPROW2
+	for {
+		con, err := getPoeConnection()
+		if err != nil && err != ErrTargetConnectionNotFound {
+			return empty, err
+		}
+
+		if err == nil {
+			return con, nil
+		}
+	}
+}
+
+func start() {
+	defer syscall.FreeLibrary(syscall.Handle(user32.Handle()))
+	defer syscall.FreeLibrary(syscall.Handle(iphlpapi.Handle()))
+	defer syscall.FreeLibrary(syscall.Handle(psapi.Handle()))
 
 	//windowHandle, err := getWindowHandleForPID(13652)
 	//fmt.Println(windowHandle, err)
-
-
 	ctx := context.Background()
-	ch := make(chan byte, 10)
+	ch := make(chan byte)
 	errorCh := make(chan error, 10)
 	go hookie.HookKeyboard(ctx, ch, errorCh)
+
+	// Find initial connection
+	var poeConnection MIB_TCPROW2
+	poeConnection, err := waitForPoeConnection()
+	if err != nil {
+		panic(err)
+	}
+
+	// The main loop
 	for {
 		select {
 		case c := <- ch:
-			fmt.Println("in selectyoyoyo")
-			fmt.Printf("%q", c)
+			if string(c) == "Q" {
+				//Kill the target connection
+				poeConnection.dwState = MIB_TCP_STATE_DELETE_TCB
+				err := SetTcpEntry(poeConnection)
+
+				// For some reason, when you tcp disconnect POE, they will open one connection, then shortly after open a new one and close the other one.
+				// This means that if we get the current connection too fast, we risk getting the connection that is already closed.
+				time.Sleep(5 * time.Second) // TODO: Find a better way to handle this problem
+
+				//if err == windows.ERROR_MR_MID_NOT_FOUND {
+				if err != nil {
+					fmt.Printf("SetTcpEntry failed: %v\n", err)
+				}
+
+				poeConnection, err = waitForPoeConnection()
+				if err != nil {
+					panic(err)
+				}
+			}
 		}
 	}
 }
@@ -310,11 +351,7 @@ func start() {
 func main() {
 	// TODO: Ask for elevation if rights are not admin
 	// TODO: Enable killing various processes by name, specified either as a flag or through a gui
-	// TODO: Enable choosing key combination for killing the connections, either as a flag or through a gui
-	// TODO: Monitor the process so we catch it when it creates a new connection after being killed
-	// TODO: Monitor the target process so that if it terminates, and is started again, we find it
-	// TODO: Remember to free all the libraries
-	// TODO: Remember to unhook hooks (v)
+	// TODO: Enable choosing key combination for killing the connections, either as a flag or through a gui (maybe fyne or gio gui)
 
 	start()
 
