@@ -8,7 +8,6 @@ import (
 	"golang.org/x/sys/windows"
 	"strings"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -314,34 +313,27 @@ func start() {
 	errorCh := make(chan error, 10)
 	go hookie.HookKeyboard(ctx, ch, errorCh)
 
-	// Find initial connection
-	var poeConnection MIB_TCPROW2
-	poeConnection, err := waitForPoeConnection()
-	if err != nil {
-		panic(err)
-	}
-
 	// The main loop
 	for {
 		select {
 		case c := <- ch:
 			if string(c) == "Q" {
 				//Kill the target connection
+				poeConnection, err := waitForPoeConnection()
+				if err != nil {
+					panic(err)
+				}
+
 				poeConnection.dwState = MIB_TCP_STATE_DELETE_TCB
-				err := SetTcpEntry(poeConnection)
+				err = SetTcpEntry(poeConnection)
 
 				// For some reason, when you tcp disconnect POE, they will open one connection, then shortly after open a new one and close the other one.
 				// This means that if we get the current connection too fast, we risk getting the connection that is already closed.
-				time.Sleep(5 * time.Second) // TODO: Find a better way to handle this problem
+				//time.Sleep(5 * time.Second) // TODO: Find a better way to handle this problem
 
 				//if err == windows.ERROR_MR_MID_NOT_FOUND {
 				if err != nil {
 					fmt.Printf("SetTcpEntry failed: %v\n", err)
-				}
-
-				poeConnection, err = waitForPoeConnection()
-				if err != nil {
-					panic(err)
 				}
 			}
 		}
@@ -352,6 +344,7 @@ func main() {
 	// TODO: Ask for elevation if rights are not admin
 	// TODO: Enable killing various processes by name, specified either as a flag or through a gui
 	// TODO: Enable choosing key combination for killing the connections, either as a flag or through a gui (maybe fyne or gio gui)
+	// TODO: Enable monitoring the PoE process so that we can know when it opens a new connection and always be ready to instantly close it.
 
 	start()
 
